@@ -1,0 +1,10 @@
+Return only valid JSON with this exact shape:
+{
+  "verdict": "likely_valid" | "likely_invalid" | "needs_more_evidence",
+  "confidence": number,
+  "reasons": string[],
+  "missing_evidence": string[]
+}
+
+Finding capsule:
+A governance function can set liquidationPenaltyBps. The setter has onlyGovernance. No upper bound is visible in the snippet. liquidationPenaltyBps is later added to debt when liquidating positions. If set too high, liquidations may become impossible. There is no evidence that ordinary users can call the setter.

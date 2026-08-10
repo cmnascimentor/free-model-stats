@@ -1,0 +1,44 @@
+{
+  "data": [
+    {
+      "id": "google/deplot",
+      "object": "model"
+    },
+    {
+      "id": "google/diffusiongemma-26b-a4b-it",
+      "object": "model"
+    },
+    {
+      "id": "google/gemma-3-12b-it",
+      "object": "model"
+    },
+    {
+      "id": "meta/llama-3.3-70b-instruct",
+      "object": "model"
+    },
+    {
+      "id": "meta/llama-guard-4-12b",
+      "object": "model"
+    },
+    {
+      "id": "mistralai/mistral-nemotron",
+      "object": "model"
+    },
+    {
+      "id": "nvidia/ai-synthetic-video-detector",
+      "object": "model"
+    },
+    {
+      "id": "nvidia/embed-qa-4",
+      "object": "model"
+    },
+    {
+      "id": "nvidia/nemotron-3-super-120b-a12b",
+      "object": "model"
+    },
+    {
+      "id": "openai/gpt-oss-120b",
+      "object": "model"
+    }
+  ]
+}

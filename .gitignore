@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.env
+.venv/
+.DS_Store
+scripts/*/results.json
+scratch.db
+results-openrouter.json
+logs/*.log
+history.db

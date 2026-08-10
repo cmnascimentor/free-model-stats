@@ -1,0 +1,11 @@
+You are given a compact Hermes Web3 candidate finding capsule.
+
+Capsule:
+- Target: Solidity staking/rewards contract.
+- Candidate claim: rewards can be claimed after a position is logically closed.
+- Evidence: closePosition() updates user.amount to zero, but pendingReward() reads accumulatedRewardDebt from a separate mapping. claimReward() checks pendingReward(user) > 0 but may not check active position status.
+- Unknowns: whether closePosition() also resets accumulatedRewardDebt indirectly, whether claimReward() is gated by onlyActivePosition, whether repeated claims are possible.
+
+Task:
+Classify the candidate as one of: likely_valid, likely_invalid, or needs_more_evidence.
+Return a concise verdict, confidence from 0.0 to 1.0, and the two most important missing checks.

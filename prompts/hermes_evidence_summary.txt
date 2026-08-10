@@ -1,0 +1,6 @@
+Summarize this Hermes audit evidence capsule into: claim, supporting evidence, assumptions, missing evidence, and next deterministic check.
+
+Evidence capsule:
+A role-gated function updates protocol fee parameters. The setter is protected by onlyOwner. The fee is later used in swap accounting. No upper bound is visible in the setter. A downstream function subtracts the fee-adjusted amount and can revert if the fee exceeds the amount. There is no confirmed path where an unprivileged user controls the setter. The suspected impact is denial of service for swaps after a bad owner update.
+
+Keep the answer under 180 words and avoid overstating exploitability.

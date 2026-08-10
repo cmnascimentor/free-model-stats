@@ -1,0 +1,6 @@
+Use the provided tool if tool calling is supported. Record a verdict for this compact model probe.
+
+Probe:
+The candidate finding is not yet proven because the current evidence only shows privileged misconfiguration risk, not an unprivileged exploit path.
+
+Expected verdict: unclear or fail, with a short reason.

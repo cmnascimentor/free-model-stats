@@ -1,0 +1,2 @@
+# The runtime uses only the Python standard library.
+# Keep this file for GitHub Actions and future optional dependencies.
