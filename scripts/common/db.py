@@ -166,19 +166,22 @@ def init_schema(conn: sqlite3.Connection) -> None:
             event_json TEXT NOT NULL
         );
 
-        CREATE INDEX IF NOT EXISTS idx_mr_run              ON model_results(run_id);
-        CREATE INDEX IF NOT EXISTS idx_mr_model            ON model_results(model);
-        CREATE INDEX IF NOT EXISTS idx_runs_ts             ON runs(timestamp);
-        CREATE INDEX IF NOT EXISTS idx_runs_platform       ON runs(platform);
-        CREATE INDEX IF NOT EXISTS idx_runs_probe          ON runs(probe_name);
-        CREATE INDEX IF NOT EXISTS idx_router_run          ON router_results(run_id);
-        CREATE INDEX IF NOT EXISTS idx_router_resolved     ON router_results(resolved_model);
-        CREATE INDEX IF NOT EXISTS idx_or_last_benchmarked ON or_models(last_benchmarked_at);
-        CREATE INDEX IF NOT EXISTS idx_runner_events_run   ON runner_events(run_id, id);
+        -- Only index columns guaranteed to exist in the pre-v2 schema here.
+        -- Indexes for additive v2 columns are created after ALTER TABLE below.
+        CREATE INDEX IF NOT EXISTS idx_mr_run            ON model_results(run_id);
+        CREATE INDEX IF NOT EXISTS idx_mr_model          ON model_results(model);
+        CREATE INDEX IF NOT EXISTS idx_runs_ts           ON runs(timestamp);
+        CREATE INDEX IF NOT EXISTS idx_runs_platform     ON runs(platform);
+        CREATE INDEX IF NOT EXISTS idx_runs_probe        ON runs(probe_name);
+        CREATE INDEX IF NOT EXISTS idx_router_run        ON router_results(run_id);
+        CREATE INDEX IF NOT EXISTS idx_router_resolved   ON router_results(resolved_model);
+        CREATE INDEX IF NOT EXISTS idx_runner_events_run ON runner_events(run_id, id);
         """
     )
 
-    # Additive migration from pre-v2 databases.
+    # Additive migration from pre-v2 databases. Create version-specific indexes
+    # only after these columns exist, otherwise an existing v1 DB fails during
+    # CREATE INDEX before ALTER TABLE gets a chance to run.
     for column, definition in (
         ("run_kind", "TEXT NOT NULL DEFAULT 'benchmark'"),
         ("benchmark_version", "TEXT"),
@@ -224,6 +227,7 @@ def init_schema(conn: sqlite3.Connection) -> None:
         ensure_column(conn, "router_results", column, definition)
 
     conn.execute("CREATE INDEX IF NOT EXISTS idx_runs_kind ON runs(run_kind)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_or_last_benchmarked ON or_models(last_benchmarked_at)")
     conn.execute(
         """UPDATE runs
            SET run_kind = 'router'
@@ -294,7 +298,7 @@ def write_run(run: dict[str, Any], db_path: Path = HISTORY_DB, platform: str = "
                 (
                     run_id,
                     model.get("model"),
-                    _bool_int(task_success),  # legacy dashboard field now means task-valid success
+                    _bool_int(task_success),
                     model.get("error"),
                     model.get("responseTime"),
                     model.get("tokensGenerated"),
