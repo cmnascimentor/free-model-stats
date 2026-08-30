@@ -2,14 +2,15 @@
 """Local FastAPI/WebSocket runner for FreeModelStats.
 
 The server executes benchmark scripts as subprocesses, persists runner job/event
-history in history.db, and streams output to connected browsers. When
-RUNNER_TOKEN is configured and the dashboard is served by this runner, a small
-runtime auth shim is injected into index.html so browser fetch/WebSocket calls
-automatically carry the token without storing it in the repository.
+history in history.db, and streams output to connected browsers. If
+RUNNER_TOKEN is configured, the browser authenticates once against a small local
+login page; the server then issues an HttpOnly SameSite=Strict session cookie.
+The configured token is never written into dashboard HTML or JavaScript.
 """
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import hmac
 import json
 import os
@@ -22,7 +23,7 @@ from typing import Any
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 REPO_ROOT = Path(__file__).resolve().parent
@@ -39,6 +40,7 @@ HOST = os.getenv("RUNNER_HOST", "127.0.0.1")
 PORT = int(os.getenv("RUNNER_PORT", "8420"))
 RUNNER_TOKEN = os.getenv("RUNNER_TOKEN", "").strip()
 LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
+SESSION_COOKIE = "freemodelstats_runner"
 
 
 def utc_now() -> str:
@@ -74,6 +76,32 @@ def _check_token(candidate: str) -> bool:
     if not expected:
         return True
     return hmac.compare_digest(candidate, expected)
+
+
+def _session_value() -> str:
+    secret = _runner_token()
+    if not secret:
+        return ""
+    return hmac.new(secret.encode("utf-8"), b"freemodelstats-runner-session-v1", hashlib.sha256).hexdigest()
+
+
+def _check_session(candidate: str | None) -> bool:
+    expected = _session_value()
+    if not expected:
+        return True
+    return bool(candidate) and hmac.compare_digest(candidate, expected)
+
+
+def _request_authenticated(request: Request) -> bool:
+    if not _runner_token():
+        return True
+    return _check_token(request.headers.get("X-Runner-Token", "")) or _check_session(request.cookies.get(SESSION_COOKIE))
+
+
+def _websocket_authenticated(websocket: WebSocket, query_token: str) -> bool:
+    if not _runner_token():
+        return True
+    return _check_token(query_token) or _check_session(websocket.cookies.get(SESSION_COOKIE))
 
 
 def _load_subprocess_env() -> dict[str, str]:
@@ -174,47 +202,30 @@ def get_known_models() -> dict[str, list[str]]:
     return models
 
 
-def _inject_runner_auth(html: str) -> str:
-    token = _runner_token()
-    if not token:
-        return html
-    # This exists only in the locally served page. It is never written to disk,
-    # committed, or exposed by GitHub Pages. Any client able to load this local
-    # runner page already has network access to the runner itself.
-    token_js = json.dumps(token)
-    shim = f"""
-<script id="runner-auth-shim">
-(() => {{
-  const runnerToken = {token_js};
-  const NativeFetch = window.fetch.bind(window);
-  window.fetch = (input, init = {{}}) => {{
-    const rawUrl = typeof input === 'string' ? input : (input && input.url) || '';
-    let url;
-    try {{ url = new URL(rawUrl, location.href); }} catch (_) {{ return NativeFetch(input, init); }}
-    if (url.port === '{PORT}' && url.pathname.startsWith('/api/')) {{
-      const headers = new Headers(init.headers || (input instanceof Request ? input.headers : undefined));
-      headers.set('X-Runner-Token', runnerToken);
-      init = {{...init, headers}};
-    }}
-    return NativeFetch(input, init);
-  }};
+def _dashboard_html() -> str:
+    html = (REPO_ROOT / "index.html").read_text(encoding="utf-8")
+    tag = '<script src="vendor/benchmark-v2.js"></script>'
+    if tag not in html:
+        html = html.replace("</body>", f"{tag}\n</body>", 1)
+    return html
 
-  const NativeWebSocket = window.WebSocket;
-  class AuthWebSocket extends NativeWebSocket {{
-    constructor(url, protocols) {{
-      const parsed = new URL(url, location.href);
-      if (parsed.port === '{PORT}' && parsed.pathname.startsWith('/ws/run/')) {{
-        parsed.searchParams.set('token', runnerToken);
-      }}
-      if (protocols === undefined) super(parsed.toString());
-      else super(parsed.toString(), protocols);
-    }}
-  }}
-  window.WebSocket = AuthWebSocket;
-}})();
-</script>
-"""
-    return html.replace("</head>", shim + "\n</head>", 1)
+
+def _login_html(error: str = "") -> str:
+    error_json = json.dumps(error)
+    return f"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>FreeModelStats Runner Login</title>
+<style>
+body{{margin:0;min-height:100vh;display:grid;place-items:center;background:#0a0908;color:#f4efe6;font-family:system-ui,sans-serif}}
+form{{width:min(420px,calc(100vw - 40px));padding:28px;border:1px solid #38321f;border-radius:16px;background:#15130e}}
+h1{{font-size:20px;margin:0 0 8px}}p{{color:#978f80;font-size:13px;line-height:1.5}}input{{box-sizing:border-box;width:100%;margin:12px 0;padding:11px;border:1px solid #38321f;border-radius:8px;background:#0a0908;color:#f4efe6}}button{{width:100%;padding:11px;border:0;border-radius:8px;background:#e8935a;color:#0a0908;font-weight:700;cursor:pointer}}#error{{color:#ef6a6a}}
+</style></head><body>
+<form id="login"><h1>FreeModelStats Runner</h1><p>Enter the local RUNNER_TOKEN to create an HttpOnly browser session.</p>
+<input id="token" type="password" autocomplete="current-password" autofocus placeholder="RUNNER_TOKEN"><button>Authenticate</button><p id="error"></p></form>
+<script>
+const initialError={error_json}; if(initialError) document.getElementById('error').textContent=initialError;
+document.getElementById('login').addEventListener('submit',async e=>{{e.preventDefault();const token=document.getElementById('token').value;const r=await fetch('/api/session',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{token}})}});if(r.ok) location.reload(); else document.getElementById('error').textContent='Invalid token';}});
+</script></body></html>"""
 
 
 app = FastAPI(title="FreeModelStats Runner", docs_url=None, redoc_url=None)
@@ -225,15 +236,44 @@ app.add_middleware(
     allow_headers=["X-Runner-Token", "Content-Type"],
 )
 app.mount("/vendor", StaticFiles(directory=str(REPO_ROOT / "vendor")), name="vendor")
-
-# Active process state only. Durable status/events live in SQLite.
 active_runs: dict[str, dict[str, Any]] = {}
 
 
 @app.get("/")
-async def serve_dashboard():
-    html = (REPO_ROOT / "index.html").read_text(encoding="utf-8")
-    return HTMLResponse(_inject_runner_auth(html))
+async def serve_dashboard(request: Request):
+    if _runner_token() and not _check_session(request.cookies.get(SESSION_COOKIE)):
+        return HTMLResponse(_login_html())
+    return HTMLResponse(_dashboard_html())
+
+
+@app.post("/api/session")
+async def create_session(request: Request):
+    if not _runner_token():
+        return {"authenticated": True}
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(400, "Expected JSON body")
+    if not isinstance(body, dict) or not _check_token(str(body.get("token") or "")):
+        raise HTTPException(403, "Invalid token")
+    response = JSONResponse({"authenticated": True})
+    response.set_cookie(
+        SESSION_COOKIE,
+        _session_value(),
+        httponly=True,
+        samesite="strict",
+        secure=False,
+        max_age=12 * 60 * 60,
+        path="/",
+    )
+    return response
+
+
+@app.post("/api/session/logout")
+async def delete_session():
+    response = JSONResponse({"authenticated": False})
+    response.delete_cookie(SESSION_COOKIE, path="/")
+    return response
 
 
 @app.get("/history.db")
@@ -253,7 +293,9 @@ async def api_models():
 
 
 @app.get("/api/run/{run_id}")
-async def api_run_status(run_id: str):
+async def api_run_status(run_id: str, request: Request):
+    if not _request_authenticated(request):
+        raise HTTPException(403, "Authentication required")
     conn = db.connect(HISTORY_DB)
     db.init_schema(conn)
     row = conn.execute("SELECT * FROM runner_jobs WHERE run_id = ?", (run_id,)).fetchone()
@@ -275,8 +317,8 @@ def _validated_string_list(value: Any, *, name: str, max_items: int) -> list[str
 
 @app.post("/api/run")
 async def start_run(request: Request, body: dict[str, Any]):
-    if not _check_token(request.headers.get("X-Runner-Token", "")):
-        raise HTTPException(403, "Invalid or missing X-Runner-Token")
+    if not _request_authenticated(request):
+        raise HTTPException(403, "Authentication required")
     if any(not run.get("complete") for run in active_runs.values()):
         raise HTTPException(409, "A run is already in progress")
 
@@ -305,21 +347,13 @@ async def start_run(request: Request, body: dict[str, Any]):
 
     if platform == "nim":
         cmd = [
-            sys.executable,
-            "-u",
-            str(SCRIPTS_DIR / "nim" / "test_models.py"),
-            "--db",
-            str(HISTORY_DB),
-            "--probe",
-            probes[0],
+            sys.executable, "-u", str(SCRIPTS_DIR / "nim" / "test_models.py"),
+            "--db", str(HISTORY_DB), "--probe", probes[0],
         ]
     else:
         cmd = [
-            sys.executable,
-            "-u",
-            str(SCRIPTS_DIR / "openrouter" / "test_models.py"),
-            "--db",
-            str(HISTORY_DB),
+            sys.executable, "-u", str(SCRIPTS_DIR / "openrouter" / "test_models.py"),
+            "--db", str(HISTORY_DB),
         ]
         for probe in probes:
             cmd += ["--probe", probe]
@@ -331,7 +365,6 @@ async def start_run(request: Request, body: dict[str, Any]):
     conn = db.connect(HISTORY_DB)
     db.init_schema(conn)
     db.create_runner_job(conn, run_id=run_id, platform=platform, command=cmd, created_at=utc_now())
-    # Keep durable local runner history bounded.
     conn.execute(
         """DELETE FROM runner_jobs WHERE run_id NOT IN
            (SELECT run_id FROM runner_jobs ORDER BY created_at DESC LIMIT 100)"""
@@ -345,6 +378,7 @@ async def start_run(request: Request, body: dict[str, Any]):
         "env": env,
         "ws_clients": set(),
         "complete": False,
+        "stopped": False,
         "task": None,
         "process": None,
     }
@@ -355,11 +389,12 @@ async def start_run(request: Request, body: dict[str, Any]):
 
 @app.post("/api/stop/{run_id}")
 async def stop_run(run_id: str, request: Request):
-    if not _check_token(request.headers.get("X-Runner-Token", "")):
-        raise HTTPException(403, "Invalid or missing X-Runner-Token")
+    if not _request_authenticated(request):
+        raise HTTPException(403, "Authentication required")
     run = active_runs.get(run_id)
     if not run:
         raise HTTPException(404, f"Unknown active run {run_id}")
+    run["stopped"] = True
     proc = run.get("process")
     if proc and proc.returncode is None:
         proc.terminate()
@@ -369,14 +404,12 @@ async def stop_run(run_id: str, request: Request):
             proc.kill()
             await proc.wait()
     await _broadcast(run_id, {"type": "status", "message": "Stopped by user"})
-    await _finish_job(run_id, status="stopped", returncode=proc.returncode if proc else None, message="Stopped by user")
-    run["complete"] = True
     return {"stopped": run_id}
 
 
 @app.websocket("/ws/run/{run_id}")
 async def ws_run(websocket: WebSocket, run_id: str, token: str = ""):
-    if not _check_token(token):
+    if not _websocket_authenticated(websocket, token):
         await websocket.close(code=4403)
         return
 
@@ -447,12 +480,7 @@ async def _finish_job(run_id: str, *, status: str, returncode: int | None, messa
     conn = db.connect(HISTORY_DB)
     db.init_schema(conn)
     db.update_runner_job(
-        conn,
-        run_id,
-        status=status,
-        finished_at=utc_now(),
-        returncode=returncode,
-        message=message,
+        conn, run_id, status=status, finished_at=utc_now(), returncode=returncode, message=message
     )
     conn.commit()
     conn.close()
@@ -486,9 +514,11 @@ async def _run_process(run_id: str, cmd: list[str], env: dict[str, str]):
                 await _broadcast(run_id, {"type": "output", "line": text})
 
         returncode = await proc.wait()
-        status = "completed" if returncode == 0 else "failed"
-        await _broadcast(run_id, {"type": "complete", "run_id": run_id, "returncode": returncode})
-        await _finish_job(run_id, status=status, returncode=returncode)
+        stopped = bool(active_runs.get(run_id, {}).get("stopped"))
+        status = "stopped" if stopped else ("completed" if returncode == 0 else "failed")
+        message = "Stopped by user" if stopped else None
+        await _broadcast(run_id, {"type": "complete", "run_id": run_id, "returncode": returncode, "status": status})
+        await _finish_job(run_id, status=status, returncode=returncode, message=message)
     except Exception as exc:  # noqa: BLE001
         run = active_runs.get(run_id)
         if run:
@@ -507,12 +537,13 @@ if __name__ == "__main__":
     conn.close()
 
     if HOST not in LOOPBACK_HOSTS:
-        print("=" * 66)
+        print("=" * 70)
         print(f"WARNING: binding to {HOST} exposes the runner to your network.")
-        print("Anyone reachable may read history.db; authenticated users can start/stop runs.")
+        print("Anyone reachable can read history.db. Start/stop/status endpoints require RUNNER_TOKEN when set.")
+        print("Use a TLS reverse proxy before relying on cookie authentication over an untrusted network.")
         if not _runner_token():
             print("WARNING: RUNNER_TOKEN is not set; mutating endpoints are unauthenticated.")
-        print("=" * 66)
+        print("=" * 70)
     print(f"FreeModelStats Runner starting on http://{HOST}:{PORT}")
     print(f"History DB: {HISTORY_DB}")
     uvicorn.run(app, host=HOST, port=PORT, log_level="info")
