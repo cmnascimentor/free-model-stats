@@ -1,0 +1,5 @@
+# Dependencies for the optional live runner (runner_server.py) ONLY.
+# The benchmark scripts and tests themselves use the Python standard library.
+# Install with: pip install -r requirements-runner.txt
+fastapi>=0.110
+uvicorn>=0.29

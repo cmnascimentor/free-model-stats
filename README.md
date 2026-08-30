@@ -59,6 +59,8 @@ export OPENROUTER_API_KEY=your_openrouter_key
 
 Either key can be omitted — `run_all.sh` skips whichever half you don't have a key for. This is also what the cron job (see below) runs every 6 hours.
 
+**Circuit breaker:** models that fail with a transport error (HTTP 4xx/5xx, network) on 3 consecutive attempts are skipped for 7 days (`breaker_state.json`, gitignored), then automatically re-probed — dead catalog entries stop burning requests every cycle, and restored models rejoin on their own. Validation-only failures (model answered but misbehaved) never trip the breaker, and a success on any probe clears a model's entries. `run_all.sh` also rotates `logs/cron.log` at ~1 MB.
+
 Individual scripts:
 
 ```bash
@@ -84,6 +86,20 @@ Offline, stdlib-only `unittest` coverage for the model discovery/filtering logic
 ```bash
 python3 -m unittest discover -s tests -v
 ```
+
+## Live runner (optional)
+
+`runner_server.py` serves the dashboard and can launch benchmark runs from the browser, streaming live progress over WebSocket:
+
+```bash
+pip install -r requirements-runner.txt   # fastapi + uvicorn (benchmarks stay stdlib-only)
+python3 runner_server.py
+# open http://127.0.0.1:8420 — serves index.html itself, no separate http.server needed
+```
+
+- Binds to `127.0.0.1:8420` by default (`RUNNER_HOST` / `RUNNER_PORT` to override).
+- **Set `RUNNER_TOKEN=<secret>` in `.env`** to require an `X-Runner-Token` header on `POST /api/run` and `/api/stop` (the browser dashboard picks it up automatically; WebSockets pass it as `?token=`).
+- **Only bind `RUNNER_HOST` to a non-loopback address if you understand the exposure** — anyone reachable could start runs (burning API quota), read `history.db`, or kill runs. The server prints a loud warning at startup if you do.
 
 ## GitHub Actions
 

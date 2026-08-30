@@ -39,6 +39,14 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      # Best-effort persistence of the circuit-breaker state between runs:
+      # runners are ephemeral, so without this the breaker starts fresh each
+      # run and dead models burn one failed request cycle again.
+      - uses: actions/cache@v4
+        with:
+          path: breaker_state.json
+          key: breaker-state-${{ github.run_id }}
+          restore-keys: breaker-state-
       - name: Test NIM model group 1
         env:
           NIM_API_KEY: ${{ secrets.NIM_API_KEY }}
@@ -46,9 +54,11 @@ jobs:
           NIM_MODEL_LIMIT: ${{ github.event.inputs.nim_model_limit || '0' }}
         run: python3 scripts/nim/test_models.py
       - uses: actions/upload-artifact@v4
+        if: ${{ always() }}
         with:
           name: results-nim-group1
           path: scripts/nim/results.json
+          if-no-files-found: warn
           retention-days: 1
 
   nim_group2:
@@ -58,6 +68,14 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      # Best-effort persistence of the circuit-breaker state between runs:
+      # runners are ephemeral, so without this the breaker starts fresh each
+      # run and dead models burn one failed request cycle again.
+      - uses: actions/cache@v4
+        with:
+          path: breaker_state.json
+          key: breaker-state-${{ github.run_id }}
+          restore-keys: breaker-state-
       - name: Test NIM model group 2
         env:
           NIM_API_KEY: ${{ secrets.NIM_API_KEY }}
@@ -65,9 +83,11 @@ jobs:
           NIM_MODEL_LIMIT: ${{ github.event.inputs.nim_model_limit || '0' }}
         run: python3 scripts/nim/test_models.py
       - uses: actions/upload-artifact@v4
+        if: ${{ always() }}
         with:
           name: results-nim-group2
           path: scripts/nim/results.json
+          if-no-files-found: warn
           retention-days: 1
 
   openrouter_benchmark:
@@ -77,6 +97,14 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      # Best-effort persistence of the circuit-breaker state between runs:
+      # runners are ephemeral, so without this the breaker starts fresh each
+      # run and dead models burn one failed request cycle again.
+      - uses: actions/cache@v4
+        with:
+          path: breaker_state.json
+          key: breaker-state-${{ github.run_id }}
+          restore-keys: breaker-state-
       - name: Discover + benchmark OpenRouter free models (scratch db)
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
@@ -86,14 +114,16 @@ jobs:
           ROUTER_RUNS="${{ github.event.inputs.router_runs || '2' }}"
           ARGS=""
           for p in $PROBES; do ARGS="$ARGS --probe $p"; done
-          python3 scripts/openrouter/discover_models.py --db scratch.db --mark-missing-inactive --limit "$MODEL_LIMIT"
-          python3 scripts/openrouter/test_models.py --db scratch.db $ARGS
+          python3 scripts/openrouter/discover_models.py --db scratch.db --mark-missing-inactive
+          python3 scripts/openrouter/test_models.py --db scratch.db --limit "$MODEL_LIMIT" $ARGS
           python3 scripts/openrouter/test_router.py --db scratch.db --probe hermes_triage --runs "$ROUTER_RUNS"
           python3 scripts/openrouter/export_scratch.py --db scratch.db --out results-openrouter.json
       - uses: actions/upload-artifact@v4
+        if: ${{ always() }}
         with:
           name: results-openrouter
           path: results-openrouter.json
+          if-no-files-found: warn
           retention-days: 1
 
   merge_and_update:
@@ -122,21 +152,42 @@ jobs:
           path: .
           if_no_artifact_found: warn
       - uses: actions/download-artifact@v4
+        continue-on-error: true
         with:
           path: artifacts
       - name: Merge NIM groups
         run: |
-          cp artifacts/results-nim-group1/results.json scripts/nim/results-group1.json
-          cp artifacts/results-nim-group2/results.json scripts/nim/results-group2.json
-          python3 scripts/nim/merge_results.py
+          found=0
+          if [ -f artifacts/results-nim-group1/results.json ]; then
+            cp artifacts/results-nim-group1/results.json scripts/nim/results-group1.json
+            found=1
+          fi
+          if [ -f artifacts/results-nim-group2/results.json ]; then
+            cp artifacts/results-nim-group2/results.json scripts/nim/results-group2.json
+            found=1
+          fi
+          if [ "$found" -eq 1 ]; then
+            python3 scripts/nim/merge_results.py
+          else
+            echo "No NIM artifacts found; skipping NIM merge."
+          fi
       - name: Ingest OpenRouter artifact
         run: |
-          python3 scripts/ingest_openrouter_artifact.py --in artifacts/results-openrouter/results-openrouter.json
+          if [ -f artifacts/results-openrouter/results-openrouter.json ]; then
+            python3 scripts/ingest_openrouter_artifact.py --in artifacts/results-openrouter/results-openrouter.json
+          else
+            echo "No OpenRouter artifact found; skipping OpenRouter ingest."
+          fi
+      - name: Vacuum history.db
+        run: |
+          python3 -c "import sys, sqlite3; sys.path.insert(0, 'scripts/common'); import db; conn = db.connect(db.HISTORY_DB); db.init_schema(conn); conn.commit(); conn.execute('VACUUM'); conn.close()"
       - name: Upload history.db as artifact
         uses: actions/upload-artifact@v4
+        if: ${{ always() }}
         with:
           name: history-db
           path: history.db
+          if-no-files-found: error
           retention-days: 90
 
   deploy_pages:
@@ -159,6 +210,7 @@ jobs:
           mkdir -p _site
           cp index.html _site/
           cp history.db _site/
+          cp -R vendor _site/
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
         with:

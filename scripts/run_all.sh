@@ -5,7 +5,16 @@ cd "$(dirname "$0")/.."
 
 mkdir -p logs
 
-if [ -f .env ]; then
+# Rotate cron log: keep last 5 rotated files, cap live log at ~1 MB
+LOG=logs/cron.log
+if [ -f "$LOG" ] && [ "$(stat -c%s "$LOG" 2>/dev/null || echo 0)" -gt 1048576 ]; then
+  for i in 4 3 2 1; do
+    [ -f "$LOG.$i" ] && mv -f "$LOG.$i" "$LOG.$((i+1))"
+  done
+  mv -f "$LOG" "$LOG.1"
+fi
+
+if [ -z "${DRY_RUN:-}" ] && [ -f .env ]; then
   set -a
   source .env
   set +a
@@ -27,7 +36,11 @@ fi
 
 if [ -n "${OPENROUTER_API_KEY:-}" ] || [ -n "$DRY_RUN_FLAG" ]; then
   echo "[$(date -Is)] Running OpenRouter benchmarks... ${DRY_RUN_FLAG}"
-  python3 scripts/openrouter/discover_models.py --mark-missing-inactive $DRY_RUN_FLAG
+  MARK_INACTIVE="--mark-missing-inactive"
+  if [ -n "$DRY_RUN_FLAG" ]; then
+    MARK_INACTIVE=""
+  fi
+  python3 scripts/openrouter/discover_models.py $MARK_INACTIVE $DRY_RUN_FLAG
   python3 scripts/openrouter/test_models.py --probe hermes_triage $DRY_RUN_FLAG
   python3 scripts/openrouter/test_router.py --probe hermes_triage --runs 2 $DRY_RUN_FLAG
 else

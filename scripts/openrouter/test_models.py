@@ -20,6 +20,7 @@ sys.path.insert(0, str(SCRIPT_DIR))
 sys.path.insert(0, str(SCRIPT_DIR.parent / "common"))
 
 import db  # noqa: E402
+import breaker  # noqa: E402
 from openrouter_client import OpenRouterClient  # noqa: E402
 from probes import (  # noqa: E402
     extract_text,
@@ -28,6 +29,7 @@ from probes import (  # noqa: E402
     response_format_for,
     tools_for,
     usage_from,
+    validate_probe_response,
 )
 from sample_data import SAMPLE_JSON, SAMPLE_TEXT  # noqa: E402
 
@@ -98,6 +100,7 @@ def main() -> int:
     probes = load_probes(args.probe or ["hermes_triage"])
     limit = args.limit if args.limit > 0 else None
     model_ids = get_active_models(conn, args.model, limit)
+    conn.close()
     if not model_ids:
         raise SystemExit("No active or_models found. Run discover_models.py first, or use --dry-run discovery.")
 
@@ -105,8 +108,19 @@ def main() -> int:
     total_inserted = 0
 
     for probe in probes:
+        # Per-probe breaker filter: a model tripped for probe A must still run
+        # probe B (keys are "model::probe"; legacy model-level keys skip all).
+        run_ids = model_ids
+        if not args.dry_run:
+            runnable, skipped = breaker.tripped_models(Path(args.db), model_ids, probe=probe.name)
+            for model in skipped:
+                print(f"Skipping: {model} (circuit breaker: repeated failures on {probe.name})")
+            run_ids = runnable
+        if not run_ids:
+            raise SystemExit("All candidate models are circuit-broken; nothing to benchmark this cycle.")
+
         results: list[dict[str, Any]] = []
-        for idx, model_id in enumerate(model_ids):
+        for idx, model_id in enumerate(run_ids):
             if idx > 0 and args.delay > 0 and not args.dry_run:
                 time.sleep(args.delay)
             if args.dry_run:
@@ -126,18 +140,32 @@ def main() -> int:
                 ok, status, response_data, err_msg = result.ok, result.status, result.data, result.error_message
                 latency_ms = result.latency_ms
 
-            text, _resolved_model, _finish_reason, _tool_call_valid = extract_text(response_data)
+            text, _resolved_model, _finish_reason, tool_call_valid = extract_text(response_data)
             usage = usage_from(response_data)
 
             error_text = None
             if not ok:
                 error_text = f"HTTP {status}: {err_msg}" if err_msg else f"HTTP {status}"
+            validation_error = validate_probe_response(
+                probe=probe,
+                http_ok=ok,
+                text=text,
+                tool_call_valid=tool_call_valid,
+            )
+            success = bool(ok and validation_error is None)
+
+            if not args.dry_run:
+                if success:
+                    breaker.record_success(Path(args.db), model_id)
+                elif error_text:  # transport/HTTP failure only — validation-only misfires never trip
+                    breaker.record_failure(Path(args.db), model_id, error_text, probe=probe.name)
 
             results.append(
                 {
                     "model": model_id,
-                    "success": bool(ok),
+                    "success": success,
                     "error": error_text,
+                    "validationError": validation_error,
                     "responseTime": latency_ms,
                     "tokensGenerated": usage["completion_tokens"],
                     "totalTokens": usage["total_tokens"],
@@ -145,7 +173,8 @@ def main() -> int:
                 }
             )
             total_inserted += 1
-            print(f"[{total_inserted}] {model_id} probe={probe.name} success={int(ok)} latency_ms={latency_ms}")
+            detail = f" validation={validation_error}" if validation_error else ""
+            print(f"[{total_inserted}] {model_id} probe={probe.name} success={int(success)} latency_ms={latency_ms}{detail}")
 
         timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         run = compile_run(timestamp, probe.prompt, results)

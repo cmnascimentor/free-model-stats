@@ -14,6 +14,7 @@ from typing import Any
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR.parent / "common"))
+import breaker  # noqa: E402
 import db  # noqa: E402
 
 API_BASE = os.getenv("API_BASE", "https://integrate.api.nvidia.com/v1")
@@ -339,6 +340,11 @@ def main() -> int:
         return 1
 
     models = selected_models(dry_run=args.dry_run)
+    if not args.dry_run:
+        runnable, skipped = breaker.tripped_models(Path(args.db), models, probe="nim_prime")
+        for model in skipped:
+            print(f"Skipping: {model} (circuit breaker: repeated failures recently)")
+        models = runnable
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     group_label = f" (Group: {MODEL_GROUP})" if MODEL_GROUP else ""
@@ -352,8 +358,11 @@ def main() -> int:
         print(f"Testing: {model}")
         result = dry_run_result(model) if args.dry_run else call_model(model, PROMPT)
         if result.get("success"):
+            breaker.record_success(Path(args.db), model)
             print(f"  ✓ Success ({result['responseTime']}ms, {result.get('tokensGenerated', 0)} tokens)")
         else:
+            if not args.dry_run:
+                breaker.record_failure(Path(args.db), model, result.get("error") or "", probe="nim_prime")
             print(f"  ✗ Failed: {result.get('error') or 'Unknown error'}")
         results.append(result)
         if not args.dry_run:

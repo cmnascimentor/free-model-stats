@@ -7,4 +7,7 @@ scripts/*/results.json
 scratch.db
 results-openrouter.json
 logs/*.log
+logs/*.log.*
 history.db
+breaker_state.json
+breaker_state.json.tmp

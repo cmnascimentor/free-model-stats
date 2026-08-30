@@ -49,8 +49,8 @@ def migrate_nim(nim_db: Path, out_conn: sqlite3.Connection) -> tuple[int, int]:
     result_count = 0
     for run in runs:
         cur = out_conn.execute(
-            """INSERT INTO runs (timestamp, platform, probe_name, prompt, success_count, total_models, fastest_model, fastest_time)
-               VALUES (?, 'nim', NULL, ?, ?, ?, ?, ?)""",
+            """INSERT INTO runs (timestamp, platform, run_kind, probe_name, prompt, success_count, total_models, fastest_model, fastest_time)
+               VALUES (?, 'nim', 'benchmark', NULL, ?, ?, ?, ?, ?)""",
             (run["timestamp"], run["prompt"], run["success_count"], run["total_models"], run["fastest_model"], run["fastest_time"]),
         )
         new_run_id = cur.lastrowid
@@ -62,7 +62,7 @@ def migrate_nim(nim_db: Path, out_conn: sqlite3.Connection) -> tuple[int, int]:
         out_conn.executemany(
             """INSERT INTO model_results (run_id, model, success, error, response_time, tokens_generated, total_tokens, response)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            [(new_run_id, r["model"], r["success"], r["error"], r["response_time"], r["tokens_generated"], r["total_tokens"], r["response"]) for r in results],
+            [(new_run_id, r["model"], r["success"], r["error"], r["response_time"], r["tokens_generated"], r["total_tokens"], db.cap_response(r["response"])) for r in results],
         )
         result_count += len(results)
     src.close()
@@ -110,8 +110,8 @@ def migrate_openrouter_pinned(or_db: Path, out_conn: sqlite3.Connection) -> tupl
                 fastest_model, fastest_time = "N/A", 0
 
             cur = out_conn.execute(
-                """INSERT INTO runs (timestamp, platform, probe_name, prompt, success_count, total_models, fastest_model, fastest_time)
-                   VALUES (?, 'openrouter', ?, ?, ?, ?, ?, ?)""",
+                """INSERT INTO runs (timestamp, platform, run_kind, probe_name, prompt, success_count, total_models, fastest_model, fastest_time)
+                   VALUES (?, 'openrouter', 'benchmark', ?, ?, ?, ?, ?, ?)""",
                 (run["timestamp"], probe_name, probe_prompt_text(probe_name), len(successful), len(rows), fastest_model, fastest_time),
             )
             new_run_id = cur.lastrowid
@@ -124,7 +124,7 @@ def migrate_openrouter_pinned(or_db: Path, out_conn: sqlite3.Connection) -> tupl
                 out_conn.execute(
                     """INSERT INTO model_results (run_id, model, success, error, response_time, tokens_generated, total_tokens, response)
                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (new_run_id, r["openrouter_id"], r["success"], error_text, r["latency_ms"], r["completion_tokens"], r["total_tokens"], r["response_excerpt"]),
+                    (new_run_id, r["openrouter_id"], r["success"], error_text, r["latency_ms"], r["completion_tokens"], r["total_tokens"], db.cap_response(r["response_excerpt"])),
                 )
                 result_count += 1
 

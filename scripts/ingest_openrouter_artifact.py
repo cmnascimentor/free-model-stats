@@ -32,10 +32,11 @@ def main() -> int:
     run_id_map: dict[int, int] = {}
     for run in payload.get("runs", []):
         cur = conn.execute(
-            """INSERT INTO runs (timestamp, platform, probe_name, prompt, success_count, total_models, fastest_model, fastest_time)
-               VALUES (?, 'openrouter', ?, ?, ?, ?, ?, ?)""",
+            """INSERT INTO runs (timestamp, platform, run_kind, probe_name, prompt, success_count, total_models, fastest_model, fastest_time)
+               VALUES (?, 'openrouter', ?, ?, ?, ?, ?, ?, ?)""",
             (
                 run.get("timestamp"),
+                run.get("run_kind") or "benchmark",
                 run.get("probe_name"),
                 run.get("prompt"),
                 run.get("success_count"),
@@ -53,8 +54,9 @@ def main() -> int:
         if new_run_id is None:
             continue
         conn.execute(
-            """INSERT INTO model_results (run_id, model, success, error, response_time, tokens_generated, total_tokens, response)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            """INSERT INTO model_results
+               (run_id, model, success, error, response_time, tokens_generated, total_tokens, response, validation_error)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 new_run_id,
                 result.get("model"),
@@ -63,7 +65,8 @@ def main() -> int:
                 result.get("response_time"),
                 result.get("tokens_generated"),
                 result.get("total_tokens"),
-                result.get("response"),
+                db.cap_response(result.get("response")),
+                result.get("validation_error"),
             ),
         )
         inserted_results += 1
@@ -97,6 +100,7 @@ def main() -> int:
         f"DELETE FROM runs WHERE id NOT IN (SELECT id FROM runs ORDER BY timestamp DESC LIMIT {db.MAX_RUNS})"
     )
     conn.commit()
+    # VACUUM is run by the dedicated CI step after merging; not duplicated here.
 
     print(
         f"ingested runs={len(run_id_map)} model_results={inserted_results} "

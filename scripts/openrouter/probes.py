@@ -86,6 +86,30 @@ def tools_for(probe: Probe) -> tuple[list[dict[str, Any]] | None, str | dict[str
     return [tool], "auto"
 
 
+def is_valid_tool_call(tool_call: Any) -> bool:
+    if not isinstance(tool_call, dict):
+        return False
+    function = tool_call.get("function")
+    if not isinstance(function, dict):
+        return False
+    if function.get("name") != "record_model_probe_verdict":
+        return False
+    args = function.get("arguments")
+    if isinstance(args, str):
+        try:
+            args = json.loads(args)
+        except json.JSONDecodeError:
+            return False
+    if not isinstance(args, dict):
+        return False
+    return (
+        args.get("verdict") in {"pass", "fail", "unclear"}
+        and isinstance(args.get("confidence"), (int, float))
+        and isinstance(args.get("reason"), str)
+        and bool(args.get("reason").strip())
+    )
+
+
 def extract_text(data: dict[str, Any] | None) -> tuple[str, str | None, str | None, bool | None]:
     if not data:
         return "", None, None, None
@@ -99,7 +123,7 @@ def extract_text(data: dict[str, Any] | None) -> tuple[str, str | None, str | No
     finish_reason = first.get("finish_reason")
     tool_call_valid = None
     if tool_calls is not None:
-        tool_call_valid = bool(tool_calls and isinstance(tool_calls, list))
+        tool_call_valid = isinstance(tool_calls, list) and any(is_valid_tool_call(call) for call in tool_calls)
     return str(content), data.get("model"), finish_reason, tool_call_valid
 
 
@@ -118,6 +142,24 @@ def is_valid_json_object(text: str) -> bool:
     except Exception:
         return False
     return isinstance(value, dict)
+
+
+def validate_probe_response(
+    *,
+    probe: Probe,
+    http_ok: bool,
+    text: str,
+    tool_call_valid: bool | None,
+) -> str | None:
+    if not http_ok:
+        return None
+    if probe.uses_tools and tool_call_valid is not True:
+        return "invalid_tool_call"
+    if not text.strip() and tool_call_valid is not True:
+        return "empty_content"
+    if probe.expects_json and not is_valid_json_object(text):
+        return "invalid_json"
+    return None
 
 
 def score_response(*, success: bool, text: str, expects_json: bool, schema_valid: bool | None, tool_call_valid: bool | None) -> float:
