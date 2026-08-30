@@ -1,0 +1,70 @@
+name: Test FreeModelStats
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  stdlib-tests:
+    name: Python ${{ matrix.python }} offline tests
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Syntax check
+        run: python -m compileall -q scripts tests
+      - name: Unit tests
+        run: python -m unittest discover -s tests -v
+      - name: Offline NIM smoke benchmark
+        run: |
+          tmp="$(mktemp -d)"
+          MODEL_GROUP=all python scripts/nim/test_models.py --dry-run --db "$tmp/nim.db" --probe hermes_triage
+      - name: Offline OpenRouter smoke benchmark
+        run: |
+          tmp="$(mktemp -d)"
+          python scripts/openrouter/discover_models.py --dry-run --db "$tmp/or.db"
+          python scripts/openrouter/test_models.py --dry-run --db "$tmp/or.db" --limit 3 --probe hermes_triage
+          python scripts/openrouter/test_router.py --dry-run --db "$tmp/or.db" --runs 1 --probe hermes_triage
+
+  frontend-syntax:
+    name: Dashboard JavaScript + assembly
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - name: Validate benchmark v2 adapter
+        run: node --check vendor/benchmark-v2.js
+      - name: Assemble production dashboard
+        run: python3 scripts/assemble_site.py --source index.html --output /tmp/freemodelstats-index.html
+      - name: Verify production dashboard loads adapter exactly once
+        run: test "$(grep -Fc 'vendor/benchmark-v2.js' /tmp/freemodelstats-index.html)" -eq 1
+
+  runner-smoke:
+    name: Runner auth + import smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements-runner.txt
+      - name: Import runner and initialize schema
+        run: python -c "import runner_server; print('runner import ok')"
+      - name: Runner authentication tests
+        run: python -m unittest tests.test_runner_auth -v

@@ -1,13 +1,9 @@
 #!/usr/bin/env python3
-"""Benchmark pinned OpenRouter :free models, one run per probe (NIM-shaped: one prompt vs N models).
-
-Adapted from openrouter-free-stats' scripts/test_models.py to write into the
-unified history.db (runs/model_results) instead of its own richer per-probe
-schema, so both benchmark suites share one dashboard.
-"""
+"""Benchmark OpenRouter :free models with the shared FreeModelStats probe suite."""
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 import time
@@ -16,42 +12,110 @@ from pathlib import Path
 from typing import Any
 
 SCRIPT_DIR = Path(__file__).resolve().parent
+COMMON_DIR = SCRIPT_DIR.parent / "common"
 sys.path.insert(0, str(SCRIPT_DIR))
-sys.path.insert(0, str(SCRIPT_DIR.parent / "common"))
+sys.path.insert(0, str(COMMON_DIR))
 
-import db  # noqa: E402
 import breaker  # noqa: E402
+import db  # noqa: E402
 from openrouter_client import OpenRouterClient  # noqa: E402
-from probes import (  # noqa: E402
+from probe_suite import (  # noqa: E402
+    BENCHMARK_VERSION,
+    DEFAULT_MAX_COMPLETION_TOKENS,
+    DEFAULT_PROBE,
+    DEFAULT_TEMPERATURE,
     extract_text,
     load_probes,
     messages_for,
+    quality_score,
     response_format_for,
     tools_for,
     usage_from,
     validate_probe_response,
 )
-from sample_data import SAMPLE_JSON, SAMPLE_TEXT  # noqa: E402
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 def dry_response(probe_name: str) -> tuple[dict[str, Any], int]:
-    content = SAMPLE_JSON if "json" in probe_name else SAMPLE_TEXT
+    if probe_name == "hermes_json_schema":
+        content = json.dumps(
+            {
+                "verdict": "needs_more_evidence",
+                "confidence": 0.82,
+                "reasons": ["setter is privileged", "downstream arithmetic may revert"],
+                "missing_evidence": ["governance reachability", "parameter bounds elsewhere"],
+            }
+        )
+        message: dict[str, Any] = {"role": "assistant", "content": content}
+    elif probe_name == "hermes_evidence_summary":
+        content = (
+            "Claim: a bad privileged fee update may cause swap denial of service.\n"
+            "Supporting evidence: onlyOwner sets the fee; downstream arithmetic can revert.\n"
+            "Assumptions: no other bounds or normalization exist.\n"
+            "Missing evidence: no unprivileged setter path is confirmed.\n"
+            "Next deterministic check: trace every fee setter and downstream bound."
+        )
+        message = {"role": "assistant", "content": content}
+    elif probe_name == "hermes_code_reasoning":
+        content = (
+            "The denominator assumption is that totalSupply() is non-zero whenever previewRedeem is reached. "
+            "External token behavior matters: token.transfer may return false, revert, charge fees, or reenter depending on the token. "
+            "Burning before transfer is not automatically a loss because an EVM revert is atomic, but a non-reverting false-return token could matter. "
+            "These assumptions need deterministic confirmation before calling this a vulnerability."
+        )
+        message = {"role": "assistant", "content": content}
+    elif probe_name == "hermes_tool_probe":
+        content = ""
+        message = {
+            "role": "assistant",
+            "content": content,
+            "tool_calls": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "record_model_probe_verdict",
+                        "arguments": json.dumps(
+                            {"verdict": "unclear", "confidence": 0.75, "reason": "missing deterministic evidence"}
+                        ),
+                    },
+                }
+            ],
+        }
+    else:
+        content = (
+            "Verdict: needs_more_evidence. Confidence: 0.84. "
+            "Check whether accumulatedRewardDebt is reset during closePosition and whether claimReward is gated by active position status. "
+            "Also test whether a repeated claim can succeed."
+        )
+        message = {"role": "assistant", "content": content}
+
     payload = {
         "model": "dry-run/sample-resolved-model",
-        "choices": [{"finish_reason": "stop", "message": {"role": "assistant", "content": content}}],
+        "choices": [{"finish_reason": "stop", "message": message}],
         "usage": {"prompt_tokens": 120, "completion_tokens": 54, "total_tokens": 174},
     }
     return payload, 37
 
 
 def get_active_models(conn, only: list[str] | None, limit: int | None) -> list[str]:
+    """Choose active models using least-recently-benchmarked rotation.
+
+    New models are tested first; after that, the oldest benchmark timestamp wins.
+    Alphabetical ID is only a stable tie-breaker, removing the old LIMIT bias.
+    """
     sql = "SELECT openrouter_id FROM or_models WHERE active = 1"
     args: list[Any] = []
     if only:
         placeholders = ",".join("?" for _ in only)
         sql += f" AND openrouter_id IN ({placeholders})"
         args.extend(only)
-    sql += " ORDER BY openrouter_id"
+    sql += (
+        " ORDER BY CASE WHEN last_benchmarked_at IS NULL THEN 0 ELSE 1 END, "
+        "last_benchmarked_at ASC, benchmark_count ASC, openrouter_id ASC"
+    )
     if limit:
         sql += " LIMIT ?"
         args.append(limit)
@@ -59,7 +123,7 @@ def get_active_models(conn, only: list[str] | None, limit: int | None) -> list[s
 
 
 def compile_run(timestamp: str, prompt: str, results: list[dict[str, Any]]) -> dict[str, Any]:
-    successful = [r for r in results if r.get("success")]
+    successful = [r for r in results if r.get("taskSuccess")]
     if successful:
         fastest = min(successful, key=lambda r: r.get("responseTime") or float("inf"))
         fastest_model, fastest_time = fastest.get("model", "N/A"), fastest.get("responseTime", 0) or 0
@@ -78,54 +142,73 @@ def compile_run(timestamp: str, prompt: str, results: list[dict[str, Any]]) -> d
     }
 
 
+def _format_success(probe_name: str, text: str, tool_call_valid: bool | None) -> bool:
+    if probe_name == "hermes_tool_probe":
+        return tool_call_valid is True
+    if probe_name == "hermes_json_schema":
+        try:
+            return isinstance(json.loads(text), dict)
+        except (TypeError, json.JSONDecodeError):
+            return False
+    return bool(text.strip())
+
+
+def _tokens_per_second(tokens: int | None, elapsed_ms: int | None) -> float | None:
+    if not tokens or not elapsed_ms or elapsed_ms <= 0:
+        return None
+    return round(tokens / (elapsed_ms / 1000.0), 3)
+
+
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Benchmark pinned OpenRouter free models")
+    parser = argparse.ArgumentParser(description="Benchmark OpenRouter free models")
     parser.add_argument("--db", default=str(db.HISTORY_DB), help="SQLite DB path")
     parser.add_argument("--model", action="append", help="Specific OpenRouter model ID to test. Can be repeated.")
-    parser.add_argument("--limit", type=int, default=0, help="Limit number of active models tested")
-    parser.add_argument("--probe", action="append", help="Probe name from prompts/. Can be repeated. Defaults to hermes_triage.")
-    parser.add_argument("--delay", type=float, default=float(os.getenv("OPENROUTER_STATS_DELAY", "3.5")), help="Delay between requests")
-    parser.add_argument("--timeout", type=int, default=90, help="HTTP timeout seconds")
-    parser.add_argument("--max-completion-tokens", type=int, default=512)
-    parser.add_argument("--temperature", type=float, default=0.0)
-    parser.add_argument("--dry-run", action="store_true", help="Do not call OpenRouter; insert deterministic sample results")
+    parser.add_argument("--limit", type=int, default=0, help="Limit active models using least-recently-tested rotation")
+    parser.add_argument("--probe", action="append", help=f"Probe name from prompts/. Defaults to {DEFAULT_PROBE}.")
+    parser.add_argument("--delay", type=float, default=float(os.getenv("OPENROUTER_STATS_DELAY", "3.5")))
+    parser.add_argument("--timeout", type=int, default=90)
+    parser.add_argument("--max-completion-tokens", type=int, default=DEFAULT_MAX_COMPLETION_TOKENS)
+    parser.add_argument("--temperature", type=float, default=DEFAULT_TEMPERATURE)
+    parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
     if not args.dry_run and not os.getenv("OPENROUTER_API_KEY"):
         raise SystemExit("OPENROUTER_API_KEY is required unless --dry-run is used")
 
-    conn = db.connect(Path(args.db))
+    db_path = Path(args.db)
+    conn = db.connect(db_path)
     db.init_schema(conn)
-
-    probes = load_probes(args.probe or ["hermes_triage"])
+    probes = load_probes(args.probe or [DEFAULT_PROBE])
     limit = args.limit if args.limit > 0 else None
     model_ids = get_active_models(conn, args.model, limit)
+    conn.commit()
     conn.close()
     if not model_ids:
-        raise SystemExit("No active or_models found. Run discover_models.py first, or use --dry-run discovery.")
+        raise SystemExit("No active or_models found. Run discover_models.py first.")
 
     client = OpenRouterClient(timeout=args.timeout)
     total_inserted = 0
 
     for probe in probes:
-        # Per-probe breaker filter: a model tripped for probe A must still run
-        # probe B (keys are "model::probe"; legacy model-level keys skip all).
         run_ids = model_ids
         if not args.dry_run:
-            runnable, skipped = breaker.tripped_models(Path(args.db), model_ids, probe=probe.name)
+            runnable, skipped = breaker.tripped_models(db_path, model_ids, probe=probe.name)
             for model in skipped:
-                print(f"Skipping: {model} (circuit breaker: repeated failures on {probe.name})")
+                print(f"Skipping: {model} (circuit breaker: repeated transport failures on {probe.name})")
             run_ids = runnable
         if not run_ids:
-            raise SystemExit("All candidate models are circuit-broken; nothing to benchmark this cycle.")
+            print(f"probe={probe.name} no runnable models; skipping probe")
+            continue
 
         results: list[dict[str, Any]] = []
         for idx, model_id in enumerate(run_ids):
             if idx > 0 and args.delay > 0 and not args.dry_run:
                 time.sleep(args.delay)
+
             if args.dry_run:
-                response_data, latency_ms = dry_response(probe.name)
+                response_data, elapsed_ms = dry_response(probe.name)
                 ok, status, err_msg = True, 200, None
+                final_attempt_ms, attempt_count = elapsed_ms, 1
             else:
                 tools, tool_choice = tools_for(probe)
                 result = client.chat_completion(
@@ -138,49 +221,87 @@ def main() -> int:
                     tool_choice=tool_choice,
                 )
                 ok, status, response_data, err_msg = result.ok, result.status, result.data, result.error_message
-                latency_ms = result.latency_ms
+                final_attempt_ms = result.latency_ms
+                elapsed_ms = result.total_elapsed_ms or result.latency_ms
+                attempt_count = result.attempt_count
 
-            text, _resolved_model, _finish_reason, tool_call_valid = extract_text(response_data)
+            text, resolved_model, finish_reason, tool_call_valid = extract_text(response_data)
             usage = usage_from(response_data)
-
-            error_text = None
-            if not ok:
-                error_text = f"HTTP {status}: {err_msg}" if err_msg else f"HTTP {status}"
+            error_text = None if ok else (f"HTTP {status}: {err_msg}" if err_msg else f"HTTP {status}")
             validation_error = validate_probe_response(
                 probe=probe,
                 http_ok=ok,
                 text=text,
                 tool_call_valid=tool_call_valid,
             )
-            success = bool(ok and validation_error is None)
+            task_success = bool(ok and validation_error is None)
+            format_success = bool(ok and _format_success(probe.name, text, tool_call_valid))
+            q_score = quality_score(probe=probe, http_ok=ok, text=text, tool_call_valid=tool_call_valid)
 
             if not args.dry_run:
-                if success:
-                    breaker.record_success(Path(args.db), model_id)
-                elif error_text:  # transport/HTTP failure only — validation-only misfires never trip
-                    breaker.record_failure(Path(args.db), model_id, error_text, probe=probe.name)
+                # The breaker models transport availability only. A semantically bad
+                # answer still proves the endpoint/model is alive and clears it.
+                if ok:
+                    breaker.record_success(db_path, model_id)
+                elif error_text:
+                    breaker.record_failure(db_path, model_id, error_text, probe=probe.name)
 
-            results.append(
-                {
-                    "model": model_id,
-                    "success": success,
-                    "error": error_text,
-                    "validationError": validation_error,
-                    "responseTime": latency_ms,
-                    "tokensGenerated": usage["completion_tokens"],
-                    "totalTokens": usage["total_tokens"],
-                    "response": text or None,
-                }
-            )
+            result_row = {
+                "model": model_id,
+                "success": task_success,
+                "transportSuccess": ok,
+                "formatSuccess": format_success,
+                "taskSuccess": task_success,
+                "qualityScore": q_score,
+                "error": error_text,
+                "validationError": validation_error,
+                "responseTime": elapsed_ms,
+                "finalAttemptMs": final_attempt_ms,
+                "totalElapsedMs": elapsed_ms,
+                "attemptCount": attempt_count,
+                "httpStatus": status,
+                "finishReason": finish_reason,
+                "resolvedModel": resolved_model,
+                "tokensGenerated": usage["completion_tokens"],
+                "totalTokens": usage["total_tokens"],
+                "tokensPerSecond": _tokens_per_second(usage["completion_tokens"], elapsed_ms),
+                "response": text or None,
+                "benchmarkVersion": BENCHMARK_VERSION,
+                "probeVersion": probe.version,
+            }
+            results.append(result_row)
             total_inserted += 1
-            detail = f" validation={validation_error}" if validation_error else ""
-            print(f"[{total_inserted}] {model_id} probe={probe.name} success={int(success)} latency_ms={latency_ms}{detail}")
 
-        timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            if not args.dry_run:
+                bench_conn = db.connect(db_path)
+                db.init_schema(bench_conn)
+                db.mark_or_model_benchmarked(bench_conn, model_id, utc_now())
+                bench_conn.commit()
+                bench_conn.close()
+
+            detail = f" validation={validation_error}" if validation_error else ""
+            print(
+                f"[{total_inserted}] {model_id} probe={probe.name} transport={int(ok)} "
+                f"task={int(task_success)} quality={q_score:.1f} elapsed_ms={elapsed_ms} attempts={attempt_count}{detail}",
+                flush=True,
+            )
+
+        timestamp = utc_now()
         run = compile_run(timestamp, probe.prompt, results)
-        run["probe_name"] = probe.name
-        run_id = db.write_run(run, db_path=Path(args.db), platform="openrouter")
-        print(f"probe={probe.name} run_id={run_id} success={run['summary']['successCount']}/{run['summary']['totalModels']}")
+        run.update(
+            {
+                "probe_name": probe.name,
+                "benchmark_version": BENCHMARK_VERSION,
+                "probe_version": probe.version,
+                "temperature": args.temperature,
+                "max_completion_tokens": args.max_completion_tokens,
+            }
+        )
+        run_id = db.write_run(run, db_path=db_path, platform="openrouter")
+        print(
+            f"probe={probe.name} run_id={run_id} task_success="
+            f"{run['summary']['successCount']}/{run['summary']['totalModels']}"
+        )
 
     print(f"model_results_inserted={total_inserted}")
     return 0

@@ -4,11 +4,11 @@ on:
   workflow_dispatch:
     inputs:
       model_limit:
-        description: "Max OpenRouter pinned free models to benchmark"
+        description: "Max OpenRouter free models to benchmark this cycle (least-recently-tested rotation)"
         required: false
         default: "20"
       nim_model_limit:
-        description: "Optional cap on NIM catalog chat models to benchmark (discovered dynamically, split across the two groups). 0 = benchmark every discovered chat model"
+        description: "Optional cap on NIM catalog chat models. 0 = all discovered"
         required: false
         default: "0"
       router_runs:
@@ -16,7 +16,7 @@ on:
         required: false
         default: "2"
       probes:
-        description: "Space-separated OpenRouter probes from prompts/"
+        description: "Space-separated OpenRouter probes. The first probe is also the NIM cross-provider baseline."
         required: false
         default: "hermes_triage"
   schedule:
@@ -25,8 +25,6 @@ on:
 permissions:
   contents: read
 
-# Never run two benchmark cycles at once: a second run would start from a stale
-# history.db artifact and clobber the accumulated history. Queue instead of cancel.
 concurrency:
   group: benchmark
   cancel-in-progress: false
@@ -39,20 +37,20 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      # Best-effort persistence of the circuit-breaker state between runs:
-      # runners are ephemeral, so without this the breaker starts fresh each
-      # run and dead models burn one failed request cycle again.
       - uses: actions/cache@v4
         with:
           path: breaker_state.json
-          key: breaker-state-${{ github.run_id }}
-          restore-keys: breaker-state-
-      - name: Test NIM model group 1
+          key: breaker-nim-group1-${{ github.run_id }}
+          restore-keys: breaker-nim-group1-
+      - name: Test NIM model group 1 on shared baseline
         env:
           NIM_API_KEY: ${{ secrets.NIM_API_KEY }}
           MODEL_GROUP: group1
           NIM_MODEL_LIMIT: ${{ github.event.inputs.nim_model_limit || '0' }}
-        run: python3 scripts/nim/test_models.py
+        run: |
+          PROBES="${{ github.event.inputs.probes || 'hermes_triage' }}"
+          CORE_PROBE="$(printf '%s\n' "$PROBES" | awk '{print $1}')"
+          python3 scripts/nim/test_models.py --probe "$CORE_PROBE"
       - uses: actions/upload-artifact@v4
         if: ${{ always() }}
         with:
@@ -68,20 +66,20 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      # Best-effort persistence of the circuit-breaker state between runs:
-      # runners are ephemeral, so without this the breaker starts fresh each
-      # run and dead models burn one failed request cycle again.
       - uses: actions/cache@v4
         with:
           path: breaker_state.json
-          key: breaker-state-${{ github.run_id }}
-          restore-keys: breaker-state-
-      - name: Test NIM model group 2
+          key: breaker-nim-group2-${{ github.run_id }}
+          restore-keys: breaker-nim-group2-
+      - name: Test NIM model group 2 on shared baseline
         env:
           NIM_API_KEY: ${{ secrets.NIM_API_KEY }}
           MODEL_GROUP: group2
           NIM_MODEL_LIMIT: ${{ github.event.inputs.nim_model_limit || '0' }}
-        run: python3 scripts/nim/test_models.py
+        run: |
+          PROBES="${{ github.event.inputs.probes || 'hermes_triage' }}"
+          CORE_PROBE="$(printf '%s\n' "$PROBES" | awk '{print $1}')"
+          python3 scripts/nim/test_models.py --probe "$CORE_PROBE"
       - uses: actions/upload-artifact@v4
         if: ${{ always() }}
         with:
@@ -92,29 +90,41 @@ jobs:
 
   openrouter_benchmark:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      # Best-effort persistence of the circuit-breaker state between runs:
-      # runners are ephemeral, so without this the breaker starts fresh each
-      # run and dead models burn one failed request cycle again.
       - uses: actions/cache@v4
         with:
           path: breaker_state.json
-          key: breaker-state-${{ github.run_id }}
-          restore-keys: breaker-state-
-      - name: Discover + benchmark OpenRouter free models (scratch db)
+          key: breaker-openrouter-${{ github.run_id }}
+          restore-keys: breaker-openrouter-
+      - name: Download prior canonical DB for scheduler state
+        uses: dawidd6/action-download-artifact@v6
+        continue-on-error: true
+        with:
+          workflow: benchmark.yml
+          workflow_conclusion: success
+          name: history-db
+          path: scheduler-seed
+          if_no_artifact_found: warn
+      - name: Discover + benchmark OpenRouter free models
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
         run: |
           MODEL_LIMIT="${{ github.event.inputs.model_limit || '20' }}"
           PROBES="${{ github.event.inputs.probes || 'hermes_triage' }}"
           ROUTER_RUNS="${{ github.event.inputs.router_runs || '2' }}"
+          if [ -f scheduler-seed/history.db ]; then
+            python3 scripts/openrouter/seed_scheduler.py --source scheduler-seed/history.db --target scratch.db
+          fi
+          python3 scripts/openrouter/discover_models.py --db scratch.db --mark-missing-inactive
           ARGS=""
           for p in $PROBES; do ARGS="$ARGS --probe $p"; done
-          python3 scripts/openrouter/discover_models.py --db scratch.db --mark-missing-inactive
           python3 scripts/openrouter/test_models.py --db scratch.db --limit "$MODEL_LIMIT" $ARGS
           python3 scripts/openrouter/test_router.py --db scratch.db --probe hermes_triage --runs "$ROUTER_RUNS"
           python3 scripts/openrouter/export_scratch.py --db scratch.db --out results-openrouter.json
@@ -128,8 +138,6 @@ jobs:
 
   merge_and_update:
     needs: [nim_group1, nim_group2, openrouter_benchmark]
-    # Publish even if some benchmark jobs failed, so a partial run still updates
-    # history — but not if the whole workflow was cancelled.
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     permissions:
@@ -140,10 +148,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Seed history.db from previous run
-        # Start from the most recent successful run's history.db so history
-        # accumulates across runs instead of being regenerated from scratch.
-        # First cycle (no prior artifact) simply starts from the committed db.
+      - name: Seed history.db from previous successful cycle
         uses: dawidd6/action-download-artifact@v6
         with:
           workflow: benchmark.yml
@@ -178,9 +183,25 @@ jobs:
           else
             echo "No OpenRouter artifact found; skipping OpenRouter ingest."
           fi
-      - name: Vacuum history.db
+      - name: Validate canonical database
         run: |
-          python3 -c "import sys, sqlite3; sys.path.insert(0, 'scripts/common'); import db; conn = db.connect(db.HISTORY_DB); db.init_schema(conn); conn.commit(); conn.execute('VACUUM'); conn.close()"
+          python3 - <<'PY'
+          import sys
+          sys.path.insert(0, 'scripts/common')
+          import db
+          conn = db.connect(db.HISTORY_DB)
+          db.init_schema(conn)
+          conn.commit()
+          result = conn.execute('PRAGMA integrity_check').fetchone()[0]
+          if result != 'ok':
+              raise SystemExit(f'SQLite integrity_check failed: {result}')
+          dangling = conn.execute('SELECT COUNT(*) FROM model_results mr LEFT JOIN runs r ON r.id=mr.run_id WHERE r.id IS NULL').fetchone()[0]
+          if dangling:
+              raise SystemExit(f'dangling model_results rows: {dangling}')
+          conn.execute('VACUUM')
+          conn.close()
+          print('canonical database integrity: ok')
+          PY
       - name: Upload history.db as artifact
         uses: actions/upload-artifact@v4
         if: ${{ always() }}
@@ -208,7 +229,7 @@ jobs:
       - name: Assemble Pages site
         run: |
           mkdir -p _site
-          cp index.html _site/
+          python3 scripts/assemble_site.py --source index.html --output _site/index.html
           cp history.db _site/
           cp -R vendor _site/
       - uses: actions/configure-pages@v5
