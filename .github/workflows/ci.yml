@@ -38,7 +38,7 @@ jobs:
           python scripts/openrouter/test_router.py --dry-run --db "$tmp/or.db" --runs 1 --probe hermes_triage
 
   runner-smoke:
-    name: Runner import smoke
+    name: Runner auth + import smoke
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -48,3 +48,5 @@ jobs:
       - run: pip install -r requirements-runner.txt
       - name: Import runner and initialize schema
         run: python -c "import runner_server; print('runner import ok')"
+      - name: Runner authentication tests
+        run: python -m unittest tests.test_runner_auth -v
