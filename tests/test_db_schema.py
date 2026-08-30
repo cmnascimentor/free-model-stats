@@ -80,25 +80,73 @@ class DbSchemaTests(unittest.TestCase):
             self.assertLessEqual(len(response), db.MAX_RESPONSE_CHARS + len("\n[truncated]"))
             self.assertTrue(response.endswith("[truncated]"))
 
-    def test_legacy_success_is_backfilled_into_v2_compatibility_columns(self):
+    def test_real_pre_v2_schema_migrates_and_backfills_success(self):
+        """Regression test for the schema that existed immediately before v2."""
         with tempfile.TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "history.db"
             conn = sqlite3.connect(db_path)
             conn.executescript(
                 """
-                CREATE TABLE runs (id INTEGER PRIMARY KEY, timestamp TEXT NOT NULL, platform TEXT NOT NULL DEFAULT 'nim');
+                PRAGMA foreign_keys=ON;
+                CREATE TABLE runs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TEXT NOT NULL,
+                    platform TEXT NOT NULL DEFAULT 'nim',
+                    run_kind TEXT NOT NULL DEFAULT 'benchmark',
+                    probe_name TEXT,
+                    prompt TEXT,
+                    success_count INTEGER,
+                    total_models INTEGER,
+                    fastest_model TEXT,
+                    fastest_time INTEGER
+                );
                 CREATE TABLE model_results (
-                  id INTEGER PRIMARY KEY, run_id INTEGER NOT NULL, model TEXT NOT NULL,
-                  success INTEGER NOT NULL DEFAULT 0, error TEXT, response_time INTEGER,
-                  tokens_generated INTEGER, total_tokens INTEGER, response TEXT
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+                    model TEXT NOT NULL,
+                    success INTEGER NOT NULL DEFAULT 0,
+                    error TEXT,
+                    response_time INTEGER,
+                    tokens_generated INTEGER,
+                    total_tokens INTEGER,
+                    response TEXT,
+                    validation_error TEXT
                 );
-                CREATE TABLE or_models (openrouter_id TEXT PRIMARY KEY, active INTEGER NOT NULL DEFAULT 1);
+                CREATE TABLE or_models (
+                    openrouter_id TEXT PRIMARY KEY,
+                    name TEXT,
+                    context_length INTEGER,
+                    max_completion_tokens INTEGER,
+                    input_modalities TEXT,
+                    output_modalities TEXT,
+                    supported_parameters TEXT,
+                    pricing_prompt TEXT,
+                    pricing_completion TEXT,
+                    expiration_date TEXT,
+                    knowledge_cutoff TEXT,
+                    active INTEGER NOT NULL DEFAULT 1,
+                    last_seen_at TEXT
+                );
                 CREATE TABLE router_results (
-                  id INTEGER PRIMARY KEY, run_id INTEGER NOT NULL, requested_model TEXT NOT NULL,
-                  success INTEGER NOT NULL, created_at TEXT NOT NULL
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+                    requested_model TEXT NOT NULL,
+                    resolved_model TEXT,
+                    probe_name TEXT,
+                    success INTEGER NOT NULL,
+                    http_status INTEGER,
+                    error_type TEXT,
+                    latency_ms INTEGER,
+                    tokens_per_second REAL,
+                    score REAL,
+                    created_at TEXT NOT NULL
                 );
-                INSERT INTO runs(id,timestamp,platform) VALUES(1,'2026-08-01T00:00:00Z','nim');
-                INSERT INTO model_results(run_id,model,success,response_time) VALUES(1,'vendor/model',1,42);
+                INSERT INTO runs(id,timestamp,platform,probe_name)
+                VALUES(1,'2026-08-01T00:00:00Z','nim','legacy_probe');
+                INSERT INTO model_results(run_id,model,success,response_time)
+                VALUES(1,'vendor/model',1,42);
+                INSERT INTO or_models(openrouter_id,name,active,last_seen_at)
+                VALUES('vendor/free:free','Legacy Free',1,'2026-08-01T00:00:00Z');
                 """
             )
             conn.commit()
@@ -107,10 +155,18 @@ class DbSchemaTests(unittest.TestCase):
             conn = db.connect(db_path)
             db.init_schema(conn)
             row = conn.execute(
-                "SELECT transport_success, format_success, task_success, quality_score, total_elapsed_ms FROM model_results"
+                "SELECT transport_success, format_success, task_success, quality_score, total_elapsed_ms "
+                "FROM model_results"
             ).fetchone()
+            or_row = conn.execute(
+                "SELECT last_benchmarked_at, benchmark_count FROM or_models WHERE openrouter_id='vendor/free:free'"
+            ).fetchone()
+            indexes = {r[1] for r in conn.execute("PRAGMA index_list(or_models)").fetchall()}
             conn.close()
+
             self.assertEqual(tuple(row), (1, 1, 1, 100.0, 42))
+            self.assertEqual(tuple(or_row), (None, 0))
+            self.assertIn("idx_or_last_benchmarked", indexes)
 
 
 if __name__ == "__main__":
