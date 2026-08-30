@@ -37,6 +37,19 @@ jobs:
           python scripts/openrouter/test_models.py --dry-run --db "$tmp/or.db" --limit 3 --probe hermes_triage
           python scripts/openrouter/test_router.py --dry-run --db "$tmp/or.db" --runs 1 --probe hermes_triage
 
+  frontend-syntax:
+    name: Dashboard JavaScript syntax
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - name: Validate benchmark v2 adapter
+        run: node --check vendor/benchmark-v2.js
+      - name: Verify adapter is deployed by index.html
+        run: grep -Fq 'vendor/benchmark-v2.js' index.html
+
   runner-smoke:
     name: Runner auth + import smoke
     runs-on: ubuntu-latest
