@@ -38,17 +38,22 @@ jobs:
           python scripts/openrouter/test_router.py --dry-run --db "$tmp/or.db" --runs 1 --probe hermes_triage
 
   frontend-syntax:
-    name: Dashboard JavaScript syntax
+    name: Dashboard JavaScript + assembly
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
       - uses: actions/setup-node@v4
         with:
           node-version: "24"
       - name: Validate benchmark v2 adapter
         run: node --check vendor/benchmark-v2.js
-      - name: Verify adapter is deployed by index.html
-        run: grep -Fq 'vendor/benchmark-v2.js' index.html
+      - name: Assemble production dashboard
+        run: python3 scripts/assemble_site.py --source index.html --output /tmp/freemodelstats-index.html
+      - name: Verify production dashboard loads adapter exactly once
+        run: test "$(grep -Fc 'vendor/benchmark-v2.js' /tmp/freemodelstats-index.html)" -eq 1
 
   runner-smoke:
     name: Runner auth + import smoke
