@@ -11,13 +11,11 @@ from dataclasses import dataclass
 from typing import Any
 
 OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
-DEFAULT_TITLE = "openrouter-free-stats"
+DEFAULT_TITLE = "free-model-stats"
 MAX_RETRIES = int(os.getenv("OPENROUTER_MAX_RETRIES", "3"))
 RETRY_BASE_DELAY = float(os.getenv("OPENROUTER_RETRY_BASE_DELAY", "5"))
-# Only retry transient server-side errors. 429 is deliberately excluded: on
-# OpenRouter's free tier every request (including a retry) counts against the
-# daily quota, so retrying a rate-limit just burns more of the budget. A 429 is
-# recorded as signal instead.
+# 429 is deliberately excluded: on the free tier, retrying a rate-limit burns
+# more quota. Only transient gateway/server failures are retried.
 RETRYABLE_STATUS_CODES = frozenset({502, 503, 504})
 
 
@@ -28,12 +26,13 @@ class ApiResult:
     data: dict[str, Any] | None
     error_type: str | None
     error_message: str | None
-    latency_ms: int
+    latency_ms: int  # final HTTP attempt only
     retry_after: float | None = None
+    attempt_count: int = 1
+    total_elapsed_ms: int | None = None  # includes retries and retry backoff
 
 
 def _parse_retry_after(value: str | None) -> float | None:
-    """Parse a Retry-After header. Supports the delta-seconds form; HTTP-date is ignored."""
     if not value:
         return None
     try:
@@ -86,32 +85,38 @@ class OpenRouterClient:
                 pass
             retry_after = _parse_retry_after(exc.headers.get("Retry-After") if exc.headers else None)
             return ApiResult(False, exc.code, None, err_type, err_msg, latency_ms, retry_after)
-        except Exception as exc:  # noqa: BLE001 - CLI tool should capture operational failures.
+        except Exception as exc:  # noqa: BLE001 - benchmark client records operational failures.
             latency_ms = int((time.perf_counter() - start) * 1000)
             return ApiResult(False, None, None, exc.__class__.__name__, str(exc)[:1000], latency_ms)
 
     def request(self, method: str, path: str, payload: dict[str, Any] | None = None) -> ApiResult:
         url = f"{OPENROUTER_BASE_URL}{path}"
         body = json.dumps(payload).encode("utf-8") if payload is not None else None
-
+        operation_started = time.perf_counter()
         result = ApiResult(False, None, None, "max_retries_exceeded", "Max retries exceeded", 0)
+
         for attempt in range(MAX_RETRIES + 1):
             req = urllib.request.Request(url=url, data=body, method=method, headers=self._headers())
             result = self._do_request(req)
+            result.attempt_count = attempt + 1
 
-            # Retry on transient server errors only (429 is not retried here).
             if result.status in RETRYABLE_STATUS_CODES and attempt < MAX_RETRIES:
                 delay = RETRY_BASE_DELAY * (2 ** attempt)
-                # Respect a server-provided Retry-After if it asks us to wait longer.
                 if result.retry_after is not None:
                     delay = max(delay, result.retry_after)
-                print(f"  ⏳ HTTP {result.status} from OpenRouter, retrying in {delay:.0f}s (attempt {attempt + 1}/{MAX_RETRIES})", flush=True)
+                print(
+                    f"  HTTP {result.status} from OpenRouter, retrying in {delay:.0f}s "
+                    f"(attempt {attempt + 1}/{MAX_RETRIES + 1})",
+                    flush=True,
+                )
                 time.sleep(delay)
                 continue
 
+            result.total_elapsed_ms = int((time.perf_counter() - operation_started) * 1000)
             return result
 
-        return result  # final attempt's result
+        result.total_elapsed_ms = int((time.perf_counter() - operation_started) * 1000)
+        return result
 
     def get_models(self) -> ApiResult:
         return self.request("GET", "/models")
