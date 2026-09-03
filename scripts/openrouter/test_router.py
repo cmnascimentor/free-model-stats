@@ -16,6 +16,7 @@ COMMON_DIR = SCRIPT_DIR.parent / "common"
 sys.path.insert(0, str(SCRIPT_DIR))
 sys.path.insert(0, str(COMMON_DIR))
 
+import breaker  # noqa: E402
 import db  # noqa: E402
 from openrouter_client import OpenRouterClient  # noqa: E402
 from probe_suite import (  # noqa: E402
@@ -109,18 +110,9 @@ def main() -> int:
     client = OpenRouterClient(timeout=args.timeout)
 
     total = 0
+    provider_failure: str | None = None
     for probe in probes:
-        run_id = db.create_router_run(
-            conn,
-            timestamp=utc_now(),
-            probe_name=probe.name,
-            prompt=probe.prompt,
-            benchmark_version=BENCHMARK_VERSION,
-            probe_version=probe.version,
-            temperature=args.temperature,
-            max_completion_tokens=args.max_completion_tokens,
-        )
-        conn.commit()
+        run_id: int | None = None
 
         for _ in range(args.runs):
             if total > 0 and args.delay > 0 and not args.dry_run:
@@ -128,7 +120,7 @@ def main() -> int:
 
             if args.dry_run:
                 response_data, elapsed_ms = dry_response(probe.name)
-                ok, status, err_type, attempts = True, 200, None, 1
+                ok, status, err_type, err_msg, attempts = True, 200, None, None, 1
             else:
                 tools, tool_choice = tools_for(probe)
                 result = client.chat_completion(
@@ -140,9 +132,20 @@ def main() -> int:
                     tools=tools,
                     tool_choice=tool_choice,
                 )
-                ok, status, response_data, err_type = result.ok, result.status, result.data, result.error_type
+                ok, status, response_data = result.ok, result.status, result.data
+                err_type, err_msg = result.error_type, result.error_message
                 elapsed_ms = result.total_elapsed_ms or result.latency_ms
                 attempts = result.attempt_count
+
+            error_text = None if ok else (f"HTTP {status}: {err_msg}" if err_msg else f"HTTP {status}: {err_type}")
+            if not args.dry_run and error_text and breaker.is_provider_scoped_failure(error_text):
+                provider_failure = error_text
+                print(
+                    f"Provider-scoped OpenRouter router failure detected; stopping without recording a bad router sample: {provider_failure}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                break
 
             text, resolved_model, _finish_reason, tool_call_valid = extract_text(response_data)
             usage = usage_from(response_data)
@@ -154,6 +157,19 @@ def main() -> int:
             )
             task_success = bool(ok and validation_error is None)
             score = quality_score(probe=probe, http_ok=ok, text=text, tool_call_valid=tool_call_valid)
+
+            if run_id is None:
+                run_id = db.create_router_run(
+                    conn,
+                    timestamp=utc_now(),
+                    probe_name=probe.name,
+                    prompt=probe.prompt,
+                    benchmark_version=BENCHMARK_VERSION,
+                    probe_version=probe.version,
+                    temperature=args.temperature,
+                    max_completion_tokens=args.max_completion_tokens,
+                )
+                conn.commit()
 
             db.insert_router_result(
                 conn,
@@ -183,7 +199,13 @@ def main() -> int:
                 f"transport={int(ok)} task={int(task_success)} elapsed_ms={elapsed_ms} attempts={attempts} quality={score:.1f}"
             )
 
+        if provider_failure:
+            break
+
+    conn.close()
     print(f"router_results_inserted={total}")
+    if provider_failure:
+        print(f"openrouter_router_provider_error={provider_failure}", file=sys.stderr)
     return 0
 
 
