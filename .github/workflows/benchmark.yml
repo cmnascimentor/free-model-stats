@@ -40,8 +40,8 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: breaker_state.json
-          key: breaker-nim-group1-${{ github.run_id }}
-          restore-keys: breaker-nim-group1-
+          key: breaker-v2-nim-group1-${{ github.run_id }}
+          restore-keys: breaker-v2-nim-group1-
       - name: Test NIM model group 1 on shared baseline
         env:
           NIM_API_KEY: ${{ secrets.NIM_API_KEY }}
@@ -69,8 +69,8 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: breaker_state.json
-          key: breaker-nim-group2-${{ github.run_id }}
-          restore-keys: breaker-nim-group2-
+          key: breaker-v2-nim-group2-${{ github.run_id }}
+          restore-keys: breaker-v2-nim-group2-
       - name: Test NIM model group 2 on shared baseline
         env:
           NIM_API_KEY: ${{ secrets.NIM_API_KEY }}
@@ -101,8 +101,8 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: breaker_state.json
-          key: breaker-openrouter-${{ github.run_id }}
-          restore-keys: breaker-openrouter-
+          key: breaker-v2-openrouter-${{ github.run_id }}
+          restore-keys: breaker-v2-openrouter-
       - name: Download prior canonical DB for scheduler state
         uses: dawidd6/action-download-artifact@v6
         continue-on-error: true
