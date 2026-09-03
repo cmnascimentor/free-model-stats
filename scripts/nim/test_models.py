@@ -356,6 +356,7 @@ def main() -> int:
     timestamp = utc_now()
     print(f"Starting NVIDIA NIM benchmark probe={probe.name} group={MODEL_GROUP} models={len(models)}")
     results: list[dict[str, Any]] = []
+    provider_error: str | None = None
 
     for model in models:
         print(f"Testing: {model}", flush=True)
@@ -366,11 +367,21 @@ def main() -> int:
             temperature=args.temperature,
             max_completion_tokens=args.max_completion_tokens,
         )
+        error_text = str(result.get("error") or "")
+        if not args.dry_run and breaker.is_provider_scoped_failure(error_text):
+            provider_error = error_text
+            print(
+                f"Provider-scoped NIM failure detected; stopping this group without tripping models: {provider_error}",
+                file=sys.stderr,
+                flush=True,
+            )
+            break
+
         if not args.dry_run:
             if result.get("transportSuccess"):
                 breaker.record_success(db_path, model)
             else:
-                breaker.record_failure(db_path, model, result.get("error") or "", probe=probe.name)
+                breaker.record_failure(db_path, model, error_text, probe=probe.name)
         results.append(result)
         print(
             f"  transport={int(bool(result.get('transportSuccess')))} task={int(bool(result.get('taskSuccess')))} "
@@ -388,14 +399,18 @@ def main() -> int:
         temperature=args.temperature,
         max_completion_tokens=args.max_completion_tokens,
     )
+    if provider_error:
+        final_json["provider_error"] = provider_error
     OUTPUT_FILE.write_text(json.dumps(final_json, indent=2), encoding="utf-8")
     success_count = final_json["summary"]["successCount"]
     total_count = final_json["summary"]["totalModels"]
     print(f"Summary: {success_count}/{total_count} task-valid")
 
-    if MODEL_GROUP == "all":
+    if MODEL_GROUP == "all" and results:
         run_id = db.write_run(final_json, db_path=db_path, platform="nim")
         print(f"History updated: {args.db} (run_id={run_id})")
+    elif MODEL_GROUP == "all" and provider_error:
+        print("History not updated because NIM returned a provider-scoped failure.")
 
     return 0
 
