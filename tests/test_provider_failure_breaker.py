@@ -23,7 +23,6 @@ class ProviderFailureBreakerTests(unittest.TestCase):
             "HTTP 401: Missing Authentication header",
             "HTTP 402: account has insufficient credits",
             "HTTP 407: proxy authentication required",
-            "HTTP 429: free-tier rate limit exceeded",
         )
         for idx, error in enumerate(errors):
             model = f"m/provider-{idx}"
@@ -46,6 +45,15 @@ class ProviderFailureBreakerTests(unittest.TestCase):
         self.assertEqual(
             breaker.tripped_models(self.db, ["m/model-only"], probe="p"),
             ([], ["m/model-only"]),
+        )
+
+    def test_429_remains_model_scoped_for_existing_breaker_semantics(self):
+        error = "HTTP 429: upstream model rate limit exceeded"
+        for _ in range(breaker.FAILURE_THRESHOLD):
+            breaker.record_failure(self.db, "m/rate-limited", error, probe="p")
+        self.assertEqual(
+            breaker.tripped_models(self.db, ["m/rate-limited"], probe="p"),
+            ([], ["m/rate-limited"]),
         )
 
     def test_old_poisoned_state_version_is_ignored(self):
