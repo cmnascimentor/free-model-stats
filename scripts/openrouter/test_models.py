@@ -188,6 +188,7 @@ def main() -> int:
 
     client = OpenRouterClient(timeout=args.timeout)
     total_inserted = 0
+    provider_failure: str | None = None
 
     for probe in probes:
         run_ids = model_ids
@@ -228,6 +229,16 @@ def main() -> int:
             text, resolved_model, finish_reason, tool_call_valid = extract_text(response_data)
             usage = usage_from(response_data)
             error_text = None if ok else (f"HTTP {status}: {err_msg}" if err_msg else f"HTTP {status}")
+
+            if not args.dry_run and error_text and breaker.is_provider_scoped_failure(error_text):
+                provider_failure = error_text
+                print(
+                    f"Provider-scoped OpenRouter failure detected; stopping model sweep without tripping models: {provider_failure}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                break
+
             validation_error = validate_probe_response(
                 probe=probe,
                 http_ok=ok,
@@ -239,8 +250,8 @@ def main() -> int:
             q_score = quality_score(probe=probe, http_ok=ok, text=text, tool_call_valid=tool_call_valid)
 
             if not args.dry_run:
-                # The breaker models transport availability only. A semantically bad
-                # answer still proves the endpoint/model is alive and clears it.
+                # The breaker models model-specific transport availability only.
+                # A semantically bad answer still proves the endpoint/model is alive.
                 if ok:
                     breaker.record_success(db_path, model_id)
                 elif error_text:
@@ -286,24 +297,32 @@ def main() -> int:
                 flush=True,
             )
 
-        timestamp = utc_now()
-        run = compile_run(timestamp, probe.prompt, results)
-        run.update(
-            {
-                "probe_name": probe.name,
-                "benchmark_version": BENCHMARK_VERSION,
-                "probe_version": probe.version,
-                "temperature": args.temperature,
-                "max_completion_tokens": args.max_completion_tokens,
-            }
-        )
-        run_id = db.write_run(run, db_path=db_path, platform="openrouter")
-        print(
-            f"probe={probe.name} run_id={run_id} task_success="
-            f"{run['summary']['successCount']}/{run['summary']['totalModels']}"
-        )
+        if results:
+            timestamp = utc_now()
+            run = compile_run(timestamp, probe.prompt, results)
+            run.update(
+                {
+                    "probe_name": probe.name,
+                    "benchmark_version": BENCHMARK_VERSION,
+                    "probe_version": probe.version,
+                    "temperature": args.temperature,
+                    "max_completion_tokens": args.max_completion_tokens,
+                }
+            )
+            run_id = db.write_run(run, db_path=db_path, platform="openrouter")
+            print(
+                f"probe={probe.name} run_id={run_id} task_success="
+                f"{run['summary']['successCount']}/{run['summary']['totalModels']}"
+            )
+        elif provider_failure:
+            print(f"probe={probe.name} run not recorded because the provider failed before a model result was obtained")
+
+        if provider_failure:
+            break
 
     print(f"model_results_inserted={total_inserted}")
+    if provider_failure:
+        print(f"openrouter_provider_error={provider_failure}", file=sys.stderr)
     return 0
 
 

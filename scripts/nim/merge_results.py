@@ -10,17 +10,30 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR.parent / "common"))
 import db  # noqa: E402
 
+GROUP_FILES = ("results-group1.json", "results-group2.json")
+
+
+def _cleanup_group_files() -> None:
+    for group_file in GROUP_FILES:
+        path = SCRIPT_DIR / group_file
+        if path.exists():
+            path.unlink()
+
 
 def main() -> int:
     all_models: list[dict] = []
     metadata: dict = {}
+    provider_errors: list[str] = []
 
-    for group_file in ["results-group1.json", "results-group2.json"]:
+    for group_file in GROUP_FILES:
         path = SCRIPT_DIR / group_file
         if not path.exists():
             continue
         data = json.loads(path.read_text(encoding="utf-8"))
         all_models.extend(data.get("models", []))
+        provider_error = data.get("provider_error")
+        if provider_error and str(provider_error) not in provider_errors:
+            provider_errors.append(str(provider_error))
         if not metadata:
             metadata = {
                 key: data.get(key)
@@ -41,8 +54,14 @@ def main() -> int:
                     raise SystemExit(f"NIM group metadata mismatch for {key}: {metadata.get(key)!r} != {data.get(key)!r}")
 
     if not all_models:
-        print("No NIM results found!", file=sys.stderr)
-        return 1
+        # An empty provider result is an operational condition, not a database
+        # merge failure. In particular, auth/account outages must not block the
+        # independent OpenRouter ingest or Pages deployment.
+        print("No NIM model results to merge; canonical database left unchanged.")
+        for provider_error in provider_errors:
+            print(f"NIM provider error: {provider_error}", file=sys.stderr)
+        _cleanup_group_files()
+        return 0
 
     successful = [m for m in all_models if m.get("taskSuccess", m.get("success"))]
     if successful:
@@ -68,10 +87,7 @@ def main() -> int:
         f"({len(successful)}/{len(all_models)} task-valid, run_id={run_id})"
     )
 
-    for group_file in ["results-group1.json", "results-group2.json"]:
-        path = SCRIPT_DIR / group_file
-        if path.exists():
-            path.unlink()
+    _cleanup_group_files()
     return 0
 
 
