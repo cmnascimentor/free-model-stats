@@ -8,9 +8,8 @@ transport failures and re-probes it after a cooldown so genuinely restored
 models rejoin the benchmark automatically.
 
 Provider/account failures must never poison individual model state. Authentication,
-account-credit, proxy-auth, and rate-limit failures are therefore ignored by the
-breaker. A successful response on ANY probe clears every breaker entry for that
-model.
+account-credit, and proxy-auth failures are therefore ignored by the breaker. A
+successful response on ANY probe clears every breaker entry for that model.
 
 State keys are "model::probe". Legacy keys (bare "model", pre-splitting)
 remain valid and apply to every probe of that model.
@@ -32,8 +31,8 @@ STATE_VERSION = 2      # v2 drops provider/account failures from model state
 
 # These statuses describe provider/account conditions rather than one model.
 # Recording them against every model caused the entire catalog to be tripped
-# when an API key expired or a free-tier quota was exhausted.
-PROVIDER_SCOPED_HTTP_STATUSES = frozenset({401, 402, 407, 429})
+# when an API key expired or account-level authentication failed.
+PROVIDER_SCOPED_HTTP_STATUSES = frozenset({401, 402, 407})
 PROVIDER_SCOPED_403_MARKERS = (
     "authentication",
     "authenticate",
@@ -101,9 +100,9 @@ def _http_status(error: str) -> int | None:
 def is_provider_scoped_failure(error: str) -> bool:
     """Return True for transport failures that should not trip one model.
 
-    401/402/407/429 are inherently provider/account scoped for the benchmark
-    APIs. A 403 is ignored only when its text clearly points to auth/account
-    state; model-specific 403s remain breaker-eligible.
+    401/402/407 are provider/account scoped for the benchmark APIs. A 403 is
+    ignored only when its text clearly points to auth/account state;
+    model-specific 403s remain breaker-eligible.
     """
     if not error:
         return False
